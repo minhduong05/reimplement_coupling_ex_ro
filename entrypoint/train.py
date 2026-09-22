@@ -158,17 +158,63 @@ def main():
     start_step = 0
     history = []
 
-    # Resume logic
-    if args.resume and os.path.exists(args.resume):
+    def save_checkpoint(curr_step: int, tag: str = "latest"):
+        """Saves full training state for resume and evaluation."""
+        if not is_main:
+            return
+        os.makedirs(args.output_dir, exist_ok=True)
+        ckpt_path = os.path.join(args.output_dir, f"checkpoint_{tag}.pt")
+        print(f"--> [Save Checkpoint] Step {curr_step} -> {ckpt_path}...", flush=True)
+        torch.save({
+            "step": curr_step,
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "history": history,
+            "model_type": args.model_type,
+            "config": config.to_dict()
+        }, ckpt_path)
+
+    # Auto-resume logic
+    resume_target = args.resume
+    if not resume_target or resume_target.lower() == "auto":
+        default_ckpt = os.path.join(args.output_dir, "checkpoint_latest.pt")
+        if os.path.exists(default_ckpt):
+            resume_target = default_ckpt
+
+    if resume_target and os.path.exists(resume_target):
         if is_main:
-            print(f"Resuming training from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+            print(f"--> [Resume] Loading checkpoint from: {resume_target}", flush=True)
+        ckpt = torch.load(resume_target, map_location=device)
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt.get("step", 0)
         history = ckpt.get("history", [])
+        if is_main:
+            print(f"--> [Resume] Successfully resumed from step {start_step}!", flush=True)
+
+    # Signal handlers for graceful Kaggle timeout / cancellation
+    current_training_step = [start_step]
+
+    def handle_interrupt(signum, frame):
+        if is_main:
+            print(f"\n[Signal {signum} received!] Emergency saving checkpoint at step {current_training_step[0]}...", flush=True)
+            save_checkpoint(current_training_step[0], tag="latest")
+            with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
+                json.dump(history, f, indent=2)
+        cleanup_distributed()
+        sys.exit(0)
+
+    try:
+        import signal
+        signal.signal(signal.SIGINT, handle_interrupt)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, handle_interrupt)
+    except Exception:
+        pass
 
     # 5. Training Loop
     raw_model.train()
@@ -178,110 +224,120 @@ def main():
     data_iter = iter(dataloader)
 
     if is_main:
-        print(f"Training from step {step} to {args.max_steps}...")
+        print(f"Training from step {step} to {args.max_steps}...", flush=True)
 
     device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    while step < args.max_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+    try:
+        while step < args.max_steps:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
 
-        step += 1
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
+            step += 1
+            current_training_step[0] = step
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
 
-        with torch.amp.autocast(device_type, dtype=torch.float16):
-            outputs = model(input_ids=input_ids, labels=labels)
-            task_loss = outputs.loss
-            if args.model_type in ["aoe", "deepseek"]:
-                aux_loss = sum(l.mlp.last_aux_loss for l in raw_model.model.layers) / len(raw_model.model.layers)
-                total_loss = task_loss + aux_loss
-            else:
-                total_loss = task_loss
-            loss = total_loss / args.grad_accum_steps
+            with torch.amp.autocast(device_type, dtype=torch.float16):
+                outputs = model(input_ids=input_ids, labels=labels)
+                task_loss = outputs.loss
+                if args.model_type in ["aoe", "deepseek"]:
+                    aux_loss = sum(l.mlp.last_aux_loss for l in raw_model.model.layers) / len(raw_model.model.layers)
+                    total_loss = task_loss + aux_loss
+                else:
+                    total_loss = task_loss
+                loss = total_loss / args.grad_accum_steps
 
-        scaler.scale(loss).backward()
-        accum_loss += loss.item()
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
 
-        if step % args.grad_accum_steps == 0 or step == args.max_steps:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()
+            if step % args.grad_accum_steps == 0 or step == args.max_steps:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
 
-            effective_accum = (step % args.grad_accum_steps) if (step % args.grad_accum_steps) != 0 else args.grad_accum_steps
-            if is_main and ((step // args.grad_accum_steps) % 10 == 0 or step == args.max_steps):
-                current_loss = (accum_loss / effective_accum) * args.grad_accum_steps
-                erc_val = getattr(raw_model, "_last_erc_loss", torch.tensor(0.0)).item()
-                lr_val = scheduler.get_last_lr()[0]
-                elapsed = time.time() - start_time
-                tok_speed = (step * args.batch_size * args.seq_len * world_size) / (elapsed + 1e-6)
+                effective_accum = (step % args.grad_accum_steps) if (step % args.grad_accum_steps) != 0 else args.grad_accum_steps
+                if is_main and ((step // args.grad_accum_steps) % 10 == 0 or step == args.max_steps):
+                    current_loss = (accum_loss / effective_accum) * args.grad_accum_steps
+                    erc_val = getattr(raw_model, "_last_erc_loss", torch.tensor(0.0)).item()
+                    lr_val = scheduler.get_last_lr()[0]
+                    elapsed = time.time() - start_time
+                    tok_speed = (step * args.batch_size * args.seq_len * world_size) / (elapsed + 1e-6)
 
-                print(f"Step {step:4d}/{args.max_steps} | Loss: {current_loss:.4f} | "
-                      f"ERC Loss: {erc_val:.4f} | LR: {lr_val:.2e} | Speed: {tok_speed:.0f} tok/s", flush=True)
-                
-                history.append({
-                    "step": step,
-                    "loss": round(current_loss, 4),
-                    "erc_loss": round(erc_val, 4),
-                    "lr": lr_val
-                })
-                with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
-                    json.dump(history, f, indent=2)
+                    print(f"Step {step:4d}/{args.max_steps} | Loss: {current_loss:.4f} | "
+                          f"ERC Loss: {erc_val:.4f} | LR: {lr_val:.2e} | Speed: {tok_speed:.0f} tok/s", flush=True)
+                    
+                    history.append({
+                        "step": step,
+                        "loss": round(current_loss, 4),
+                        "erc_loss": round(erc_val, 4),
+                        "lr": lr_val
+                    })
+                    with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
+                        json.dump(history, f, indent=2)
 
-                if args.use_wandb:
-                    try:
-                        import wandb
-                        wandb_payload = {
-                            "train/total_loss": current_loss,
-                            "train/erc_loss": erc_val,
-                            "train/learning_rate": lr_val,
-                            "train/throughput_tokens_per_sec": tok_speed,
-                            "train/tokens_trained": step * args.batch_size * args.seq_len * world_size,
-                        }
-                        if hasattr(raw_model, "_last_erc_matrices") and raw_model._last_erc_matrices:
-                            M = raw_model._last_erc_matrices[0]
-                            n = M.size(0)
-                            diag = torch.diag(M).mean().item()
-                            mask = torch.ones_like(M) - torch.eye(n, device=M.device)
-                            off_diag = (M * mask).sum().item() / (n * (n - 1) + 1e-8)
-                            wandb_payload["train/specialization_ratio"] = diag / (off_diag + 1e-8)
-                        wandb.log(wandb_payload, step=step)
-                    except Exception:
-                        pass
+                    if args.use_wandb:
+                        try:
+                            import wandb
+                            wandb_payload = {
+                                "train/total_loss": current_loss,
+                                "train/erc_loss": erc_val,
+                                "train/learning_rate": lr_val,
+                                "train/throughput_tokens_per_sec": tok_speed,
+                                "train/tokens_trained": step * args.batch_size * args.seq_len * world_size,
+                            }
+                            if hasattr(raw_model, "_last_erc_matrices") and raw_model._last_erc_matrices:
+                                M = raw_model._last_erc_matrices[0]
+                                n = M.size(0)
+                                diag = torch.diag(M).mean().item()
+                                mask = torch.ones_like(M) - torch.eye(n, device=M.device)
+                                off_diag = (M * mask).sum().item() / (n * (n - 1) + 1e-8)
+                                wandb_payload["train/specialization_ratio"] = diag / (off_diag + 1e-8)
+                            wandb.log(wandb_payload, step=step)
+                        except Exception:
+                            pass
 
-            accum_loss = 0.0
+                accum_loss = 0.0
 
-        if is_main and step % args.save_every == 0:
-            ckpt_path = os.path.join(args.output_dir, "checkpoint_latest.pt")
-            print(f"--> Saving checkpoint at step {step} to {ckpt_path}...")
-            torch.save({
-                "step": step,
-                "model": raw_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "scaler": scaler.state_dict(),
-                "history": history
-            }, ckpt_path)
+            # Periodic checkpoint saving
+            if is_main and (step % args.save_every == 0 or step == args.max_steps):
+                save_checkpoint(step, tag="latest")
 
-    if is_main:
-        print("\nSaving final model...")
-        raw_model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        if args.use_wandb:
+        # 6. Final Model Saving
+        if is_main:
+            print("\n=== Training Completed: Saving Final Model & Artifacts ===", flush=True)
+            # Save checkpoint_final.pt and standalone weights
+            save_checkpoint(step, tag="final")
+            weights_path = os.path.join(args.output_dir, "model_final.pt")
+            torch.save(raw_model.state_dict(), weights_path)
+            print(f"--> Saved standalone model weights to {weights_path}", flush=True)
+
+            # Save HF transformers artifacts
+            try:
+                raw_model.save_pretrained(args.output_dir)
+                tokenizer.save_pretrained(args.output_dir)
+                print(f"--> Saved Hugging Face model and tokenizer to {args.output_dir}", flush=True)
+            except Exception as e:
+                print(f"[Warning] save_pretrained failed: {e}", flush=True)
+
+            with open(os.path.join(args.output_dir, "training_history.json"), "w") as f:
+                json.dump(history, f, indent=2)
+            print("Done training successfully!", flush=True)
+
+    finally:
+        if is_main and args.use_wandb:
             try:
                 import wandb
                 wandb.finish()
             except Exception:
                 pass
-        print("Done training successfully!")
-
-    cleanup_distributed()
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
