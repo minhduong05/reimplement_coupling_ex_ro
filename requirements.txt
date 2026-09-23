@@ -1,0 +1,32 @@
+# ==============================================================================
+# Requirements for Coupling Experts and Routers in MoE (ICLR 2026 Reimplementation)
+# ==============================================================================
+
+# --- Deep Learning Core ---
+torch>=2.1.0
+
+# --- Hugging Face Ecosystem ---
+transformers>=4.40.0
+tokenizers>=0.19.0
+datasets>=2.18.0
+accelerate>=0.28.0
+safetensors>=0.4.0
+huggingface-hub>=0.20.0
+
+# --- Tensor Operations & MoE Utilities ---
+einops>=0.7.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# --- Data Streaming, Serialization & Networking ---
+pyarrow>=14.0.0
+fsspec>=2023.6.0
+requests>=2.31.0
+urllib3>=2.0.0
+
+# --- Experiment Tracking & Monitoring ---
+wandb>=0.16.0
+
+# --- Visualization & Progress Tracking ---
+matplotlib>=3.8.0
+tqdm>=4.66.0
